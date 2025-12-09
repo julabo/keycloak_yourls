@@ -1,24 +1,28 @@
 <?php
 /*
 Plugin Name: Keycloak
-Plugin URI: https://github.com/julabo/yourls_keycloak
-Description: Provides Keycloak user authentication
+Plugin URI: https://github.com/julabo/keycloak_yourls
+Description: Provides Keycloak user authentication with rate limiting and secure session management
 Author: Jan Leehr
 Author URI: https://julabo.com
-Version: 1.0.0
+Version: 1.0.2
 */
 
-// No direct call
-use League\OAuth2\Client\Token\AccessToken;
-use Stevenmaguire\OAuth2\Client\Provider\Keycloak;
-
+// Prevent direct access
 if (!defined('YOURLS_ABSPATH')) {
     die();
 }
 
-// Plugin activation hook
-yourls_add_action('activated_keycloak/plugin.php', 'oidc_activate');
-function oidc_activate() {
+// Import required classes
+use League\OAuth2\Client\Token\AccessToken;
+use Stevenmaguire\OAuth2\Client\Provider\Keycloak;
+
+/**
+ * Plugin activation handler
+ * Initializes database tables and displays activation notice
+ */
+yourls_add_action('activated_keycloak_yourls/plugin.php', 'oidc_activate');
+function oidc_activate(): void {
     require_once __DIR__ . '/OIDCRateLimiter.php';
 
     if (OIDCRateLimiter::init()) {
@@ -28,37 +32,56 @@ function oidc_activate() {
     }
 }
 
-// Plugin deactivation hook
-yourls_add_action('deactivated_keycloak/plugin.php', 'oidc_deactivate');
-function oidc_deactivate() {
-    // Clear any OIDC-related sessions
-    if (session_status() === PHP_SESSION_ACTIVE) {
-        $session_keys_to_clear = [
-            'oidc_access_token',
-            'oidc_refresh_token',
-            'oidc_token_expires_at',
-            'oidc_id_token',
-            'oidc_username',
-            'oauth2state',
-            'oauth2_code_verifier'
-        ];
+/**
+ * Plugin deactivation handler
+ * Cleans up database tables, sessions, and cookies
+ */
+yourls_add_action('deactivated_keycloak_yourls/plugin.php', 'oidc_deactivate');
+function oidc_deactivate(): void {
+    try {
+        global $ydb;
 
-        foreach ($session_keys_to_clear as $key) {
-            if (isset($_SESSION[$key])) {
-                unset($_SESSION[$key]);
+        // Remove rate limiting database table
+        $db_prefix = defined('YOURLS_DB_PREFIX') ? YOURLS_DB_PREFIX : 'yourls_';
+        $table_name = $db_prefix . 'oidc_rate_limit';
+        $ydb->fetchAffected("DROP TABLE IF EXISTS `$table_name`");
+
+        // Clear OIDC-related session data
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            $session_keys_to_clear = [
+                'oidc_access_token',
+                'oidc_refresh_token',
+                'oidc_token_expires_at',
+                'oidc_id_token',
+                'oidc_username',
+                'oauth2state',
+                'oauth2_code_verifier'
+            ];
+
+            foreach ($session_keys_to_clear as $key) {
+                if (isset($_SESSION[$key])) {
+                    unset($_SESSION[$key]);
+                }
             }
         }
-    }
 
-    yourls_add_notice('Keycloak plugin deactivated. Sessions cleared. Database table preserved.');
+        // Clear OIDC authentication cookie
+        oidc_clear_cookie();
+
+        yourls_add_notice('Keycloak plugin deactivated successfully. Database table and sessions cleared.');
+
+    } catch (Exception $e) {
+        error_log('Keycloak deactivation error: ' . $e->getMessage());
+        yourls_add_notice('Keycloak plugin deactivated with warnings. Check logs.', 'error');
+    }
 }
 
-// Security constants
+// Define security constants
 if (!defined('OIDC_BYPASS_YOURLS_AUTH')) {
     define('OIDC_BYPASS_YOURLS_AUTH', false);
 }
 
-// Rate limiting constants
+// Define rate limiting constants
 if (!defined('OIDC_MAX_AUTH_ATTEMPTS')) {
     define('OIDC_MAX_AUTH_ATTEMPTS', 5);
 }
@@ -69,12 +92,18 @@ if (!defined('OIDC_TOKEN_REFRESH_THRESHOLD')) {
     define('OIDC_TOKEN_REFRESH_THRESHOLD', 300); // 5 minutes before expiry
 }
 
-// Load configuration from environment or constants
-function oidc_get_config($key, $default = null) {
+/**
+ * Get configuration value from environment variables or constants
+ *
+ * @param string $key Configuration key (without OIDC_ prefix)
+ * @param mixed $default Default value if not found
+ * @return mixed Configuration value or default
+ */
+function oidc_get_config(string $key, mixed $default = null): mixed {
     $env_key = 'OIDC_' . $key;
     $const_key = 'OIDC_' . $key;
 
-    // Try the environment variable first
+    // Try environment variable first
     $value = getenv($env_key) ?: ($_ENV[$env_key] ?? null);
 
     // Fall back to constant
@@ -85,7 +114,7 @@ function oidc_get_config($key, $default = null) {
     return $value ?: $default;
 }
 
-// Early exit if the required configuration is missing
+// Validate required configuration before initialization
 $required_configs = ['BASE_URL', 'REALM', 'CLIENT_NAME', 'CLIENT_SECRET', 'REDIRECT_URL'];
 foreach ($required_configs as $config) {
     if (!oidc_get_config($config)) {
@@ -96,7 +125,7 @@ foreach ($required_configs as $config) {
     }
 }
 
-// Validate URLs
+// Validate URL configuration
 if (!filter_var(oidc_get_config('BASE_URL'), FILTER_VALIDATE_URL) ||
     !filter_var(oidc_get_config('REDIRECT_URL'), FILTER_VALIDATE_URL)) {
     if (function_exists('yourls_add_notice')) {
@@ -105,18 +134,18 @@ if (!filter_var(oidc_get_config('BASE_URL'), FILTER_VALIDATE_URL) ||
     return;
 }
 
-// Start the session securely
+// Initialize secure session
 if (session_status() === PHP_SESSION_NONE) {
-    ini_set('session.cookie_httponly', 1);
-    ini_set('session.cookie_secure', yourls_is_ssl() ? 1 : 0);
-    ini_set('session.use_strict_mode', 1);
+    ini_set('session.cookie_httponly', '1');
+    ini_set('session.cookie_secure', yourls_is_ssl() ? '1' : '0');
+    ini_set('session.use_strict_mode', '1');
     ini_set('session.cookie_samesite', 'Lax');
-    ini_set('session.gc_maxlifetime', 3600); // 1 hour
-    ini_set('session.cookie_lifetime', 0); // Session cookie
+    ini_set('session.gc_maxlifetime', '3600'); // 1 hour
+    ini_set('session.cookie_lifetime', '0'); // Session cookie
     session_start();
 }
 
-// Load dependencies with error handling
+// Load dependencies
 if (!file_exists(__DIR__ . '/vendor/autoload.php')) {
     if (function_exists('yourls_add_notice')) {
         yourls_add_notice('OIDC plugin: Composer dependencies not installed. Run composer install in plugin directory.', 'error');
@@ -127,24 +156,28 @@ if (!file_exists(__DIR__ . '/vendor/autoload.php')) {
 require_once __DIR__ . '/vendor/autoload.php';
 require_once __DIR__ . '/OIDCRateLimiter.php';
 
-// Initialize rate limiter only if the plugin is active (not during activation)
+// Initialize rate limiter
 if (!yourls_is_installing() && !defined('YOURLS_INSTALLING')) {
     OIDCRateLimiter::init();
 }
 
-// Initialize OIDC provider with validation
-function oidc_get_provider(): ?Keycloak
-{
+/**
+ * Initialize and return OIDC provider instance
+ * Uses singleton pattern for efficiency
+ *
+ * @return Keycloak|null OIDC provider instance or null on error
+ */
+function oidc_get_provider(): ?Keycloak {
     static $oidc = null;
 
     if ($oidc === null) {
         try {
             $oidc = new Keycloak([
-                'authServerUrl'         => rtrim(oidc_get_config('BASE_URL'), '/'),
-                'realm'                 => oidc_get_config('REALM'),
-                'clientId'              => oidc_get_config('CLIENT_NAME'),
-                'clientSecret'          => oidc_get_config('CLIENT_SECRET'),
-                'redirectUri'           => oidc_get_config('REDIRECT_URL'),
+                'authServerUrl' => rtrim(oidc_get_config('BASE_URL'), '/'),
+                'realm' => oidc_get_config('REALM'),
+                'clientId' => oidc_get_config('CLIENT_NAME'),
+                'clientSecret' => oidc_get_config('CLIENT_SECRET'),
+                'redirectUri' => oidc_get_config('REDIRECT_URL'),
             ]);
         } catch (Exception $e) {
             error_log('OIDC provider initialization error: ' . $e->getMessage());
@@ -155,20 +188,23 @@ function oidc_get_provider(): ?Keycloak
     return $oidc;
 }
 
-// Token refresh functionality
-function oidc_refresh_token_if_needed(): bool
-{
-    // If we don't have tokens in session, don't attempt refresh
-    // This is normal for cookie-based authentication after redirect
+/**
+ * Refresh OIDC token if it's about to expire
+ *
+ * @return bool True if refresh succeeded or wasn't needed, false on failure
+ */
+function oidc_refresh_token_if_needed(): bool {
+    // Skip if tokens not available (normal for cookie-based auth)
     if (!isset($_SESSION['oidc_access_token']) || !isset($_SESSION['oidc_refresh_token'])) {
-        return true; // Return true because this is not an error condition
+        return true;
     }
 
     $expires_at = $_SESSION['oidc_token_expires_at'] ?? 0;
     $refresh_threshold = time() + OIDC_TOKEN_REFRESH_THRESHOLD;
 
+    // Token still valid
     if ($expires_at > $refresh_threshold) {
-        return true; // Token still valid
+        return true;
     }
 
     try {
@@ -195,25 +231,30 @@ function oidc_refresh_token_if_needed(): bool
     } catch (Exception $e) {
         error_log('Token refresh failed: ' . $e->getMessage());
 
-        // Clear invalid tokens but don't fail authentication
-        // The cookie is still valid for authentication purposes
+        // Clear invalid tokens but continue with cookie-based auth
         unset($_SESSION['oidc_access_token']);
         unset($_SESSION['oidc_refresh_token']);
         unset($_SESSION['oidc_token_expires_at']);
 
-        // Return true because cookie-based authentication doesn't require token refresh
-        return true;
+        return true; // Cookie-based auth doesn't require token refresh
     }
 }
 
-// Secure cookie name generation
-function oidc_get_cookie_name(): string
-{
+/**
+ * Generate secure cookie name with hash
+ *
+ * @return string Secure cookie name
+ */
+function oidc_get_cookie_name(): string {
     return 'OIDC_user_' . substr(hash('sha256', YOURLS_COOKIEKEY . 'oidc'), 0, 8);
 }
 
-// Validate OIDC cookie and refresh token if needed
-function oidc_validate_cookie() {
+/**
+ * Validate OIDC cookie and refresh token if needed
+ *
+ * @return string|false Username if valid, false otherwise
+ */
+function oidc_validate_cookie(): string|false {
     $cookie_name = oidc_get_cookie_name();
 
     if (!isset($_COOKIE[$cookie_name])) {
@@ -222,7 +263,7 @@ function oidc_validate_cookie() {
 
     $cookie_data = $_COOKIE[$cookie_name];
 
-    // Use our own decryption method
+    // Decode cookie data
     $decoded = base64_decode($cookie_data);
     if (!$decoded) {
         return false;
@@ -241,15 +282,15 @@ function oidc_validate_cookie() {
         return false;
     }
 
-    // Now parse the original value (username|timestamp|hash)
+    // Parse original value
     $value_parts = explode('|', $original_value, 3);
     if (count($value_parts) !== 3) {
         return false;
     }
 
-    list($username, $timestamp, $hash) = $value_parts;
+    [$username, $timestamp, $hash] = $value_parts;
 
-    // Check timestamp (validate within cookie lifetime)
+    // Check cookie age
     $cookie_lifetime = yourls_get_cookie_life();
     if (time() - intval($timestamp) > $cookie_lifetime) {
         return false;
@@ -261,9 +302,8 @@ function oidc_validate_cookie() {
         return false;
     }
 
-    // Try to refresh the token if needed
+    // Refresh token if needed
     if (!oidc_refresh_token_if_needed()) {
-        // Token refresh failed, invalidate cookie
         oidc_clear_cookie();
         return false;
     }
@@ -271,14 +311,18 @@ function oidc_validate_cookie() {
     return $username;
 }
 
-// Secure cookie setting
-function oidc_set_secure_cookie($username) {
+/**
+ * Set secure OIDC authentication cookie
+ *
+ * @param string $username Username to store in cookie
+ */
+function oidc_set_secure_cookie(string $username): void {
     $cookie_name = oidc_get_cookie_name();
     $timestamp = time();
     $hash = hash_hmac('sha256', $username . $timestamp, YOURLS_COOKIEKEY);
     $value = $username . '|' . $timestamp . '|' . $hash;
 
-    // Use our own secure method instead of yourls_auth_signature
+    // Create signature
     $signature = hash_hmac('sha256', $value, YOURLS_COOKIEKEY);
     $encrypted_value = base64_encode($value . '|' . $signature);
 
@@ -298,8 +342,10 @@ function oidc_set_secure_cookie($username) {
     ]);
 }
 
-// Clear OIDC cookie
-function oidc_clear_cookie() {
+/**
+ * Clear OIDC authentication cookie
+ */
+function oidc_clear_cookie(): void {
     $cookie_name = oidc_get_cookie_name();
     $path = yourls_apply_filter('setcookie_path', '/');
     $domain = yourls_apply_filter('setcookie_domain', parse_url(yourls_get_yourls_site(), PHP_URL_HOST));
@@ -316,59 +362,21 @@ function oidc_clear_cookie() {
     ]);
 }
 
-// Helper function to remove query arguments from URL
-function oidc_remove_query_args($args_to_remove, $url) {
-    $url_parts = parse_url($url);
-
-    if (!isset($url_parts['query'])) {
-        return $url;
-    }
-
-    parse_str($url_parts['query'], $query_params);
-
-    // Remove specified arguments
-    foreach ($args_to_remove as $arg) {
-        unset($query_params[$arg]);
-    }
-
-    // Rebuild the URL
-    $new_url = '';
-
-    if (isset($url_parts['scheme'])) {
-        $new_url .= $url_parts['scheme'] . '://';
-    }
-
-    if (isset($url_parts['host'])) {
-        $new_url .= $url_parts['host'];
-    }
-
-    if (isset($url_parts['port'])) {
-        $new_url .= ':' . $url_parts['port'];
-    }
-
-    if (isset($url_parts['path'])) {
-        $new_url .= $url_parts['path'];
-    }
-
-    if (!empty($query_params)) {
-        $new_url .= '?' . http_build_query($query_params);
-    }
-
-    if (isset($url_parts['fragment'])) {
-        $new_url .= '#' . $url_parts['fragment'];
-    }
-
-    return $new_url;
-}
-
+/**
+ * Main authentication filter for YOURLS
+ * Handles OIDC authentication flow
+ *
+ * @param bool $valid Current authentication status
+ * @return bool True if authenticated, false otherwise
+ */
 yourls_add_filter('is_valid_user', 'oidc_auth');
-function oidc_auth($valid) {
+function oidc_auth(bool $valid): bool {
     // Skip for API requests
     if (yourls_is_API()) {
         return $valid;
     }
 
-    // Check existing valid authentication first
+    // Return early if already authenticated
     if ($valid) {
         return $valid;
     }
@@ -380,32 +388,35 @@ function oidc_auth($valid) {
         yourls_die('Too many authentication attempts. Please try again later.', 'Authentication Blocked', 429);
     }
 
-    // Check for a valid OIDC cookie first (before handling callback)
+    // Check for valid OIDC cookie
     $username = oidc_validate_cookie();
     if ($username) {
         yourls_set_user($username);
         return true;
     }
 
-    // Handle OAuth2 callback (only if we have code and state, but no valid cookie)
-    if (isset($_GET['code']) && isset($_GET['state'])) {
+    // Handle OAuth2 callback
+    if (isset($_GET['code'], $_GET['state'])) {
         oidc_handle_callback();
         return true;
     }
 
-    // Only redirect if we don't have any Keycloak session parameters
-    // This prevents redirect loops after failed authentication
-    if (!isset($_GET['session_state']) && !isset($_GET['iss'])) {
+    // Redirect to OIDC provider (prevent redirect loops)
+    if (!isset($_GET['session_state'], $_GET['iss'])) {
         oidc_redirect_to_provider();
     }
 
     return false;
 }
 
-function oidc_handle_callback() {
+/**
+ * Handle OAuth2 callback from Keycloak
+ * Processes authorization code and creates user session
+ */
+function oidc_handle_callback(): void {
     $client_ip = yourls_get_IP();
 
-    // Validate state parameter
+    // Validate CSRF state parameter
     if (empty($_GET['state']) || empty($_SESSION['oauth2state']) ||
         !hash_equals($_SESSION['oauth2state'], $_GET['state'])) {
 
@@ -416,24 +427,22 @@ function oidc_handle_callback() {
     }
 
     unset($_SESSION['oauth2state']);
-
     $oidc = oidc_get_provider();
 
     try {
-        // Get access token with PKCE
-        $tokenParams = [
-            'code' => $_GET['code']
-        ];
+        // Prepare token request parameters
+        $tokenParams = ['code' => $_GET['code']];
 
-        // Add PKCE code verifier if it was used
+        // Add PKCE code verifier if available
         if (isset($_SESSION['oauth2_code_verifier'])) {
             $tokenParams['code_verifier'] = $_SESSION['oauth2_code_verifier'];
             unset($_SESSION['oauth2_code_verifier']);
         }
 
+        // Exchange authorization code for access token
         $token = $oidc->getAccessToken('authorization_code', $tokenParams);
 
-        // Get user information
+        // Get user information from token
         $resource_owner = $oidc->getResourceOwner($token);
         $user_data = $resource_owner->toArray();
         $username = $user_data['preferred_username'] ?? null;
@@ -443,7 +452,7 @@ function oidc_handle_callback() {
             yourls_die('OIDC: Unable to retrieve username from provider.');
         }
 
-        // Validate username (allow various formats but prevent malicious input)
+        // Validate username format and security
         if (empty($username) || strlen($username) > 255 ||
             preg_match('/[<>"\'\\\\\x00-\x1F\x7F]/', $username)) {
             OIDCRateLimiter::recordAttempt($client_ip, false);
@@ -460,13 +469,11 @@ function oidc_handle_callback() {
         // Record successful authentication
         OIDCRateLimiter::recordAttempt($client_ip, true);
 
-        // Set secure cookie
+        // Set secure cookie and YOURLS user
         oidc_set_secure_cookie($username);
-
-        // Set user in YOURLS
         yourls_set_user($username);
 
-        // Clean redirect to avoid replay attacks - redirect to base admin URL
+        // Redirect to admin interface
         header('Location: ' . YOURLS_SITE . '/admin/');
         exit;
 
@@ -477,24 +484,27 @@ function oidc_handle_callback() {
     }
 }
 
-function oidc_redirect_to_provider() {
+/**
+ * Redirect user to OIDC provider for authentication
+ * Uses PKCE for additional security
+ */
+function oidc_redirect_to_provider(): void {
     $oidc = oidc_get_provider();
 
     try {
-        // Generate and store state
+        // Generate CSRF protection state
         $state = bin2hex(random_bytes(32));
         $_SESSION['oauth2state'] = $state;
 
-        // Generate PKCE parameters
+        // Generate PKCE parameters for additional security
         $codeVerifier = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
         $codeChallenge = rtrim(strtr(base64_encode(hash('sha256', $codeVerifier, true)), '+/', '-_'), '=');
-
-        // Store code verifier in session for later use
         $_SESSION['oauth2_code_verifier'] = $codeVerifier;
 
+        // Build authorization URL
         $authUrl = $oidc->getAuthorizationUrl([
             'state' => $state,
-            'scope' => 'openid profile email offline_access', // offline_access for refresh tokens
+            'scope' => 'openid profile email offline_access',
             'code_challenge' => $codeChallenge,
             'code_challenge_method' => 'S256'
         ]);
@@ -508,24 +518,30 @@ function oidc_redirect_to_provider() {
     }
 }
 
+/**
+ * Handle user logout
+ * Clears cookies, sessions, and redirects to Keycloak logout
+ */
 yourls_add_action('logout', 'oidc_logout');
-function oidc_logout() {
-    // Clear YOURLS cookie
+function oidc_logout(): void {
+    // Clear YOURLS authentication
     yourls_store_cookie(null);
 
     // Clear OIDC cookie
     oidc_clear_cookie();
 
-    // Get stored tokens for logout
+    // Get ID token for proper logout
     $id_token = $_SESSION['oidc_id_token'] ?? null;
 
-    // Clear session
+    // Destroy session
     if (session_status() === PHP_SESSION_ACTIVE) {
         session_destroy();
     }
 
-    // Redirect to Keycloak logout
-    $logout_url = rtrim(oidc_get_config('BASE_URL'), '/') . '/realms/' . urlencode(oidc_get_config('REALM')) . '/protocol/openid-connect/logout';
+    // Build Keycloak logout URL
+    $logout_url = rtrim(oidc_get_config('BASE_URL'), '/') .
+        '/realms/' . urlencode(oidc_get_config('REALM')) .
+        '/protocol/openid-connect/logout';
 
     $logout_params = [
         'client_id' => oidc_get_config('CLIENT_NAME'),
@@ -541,33 +557,40 @@ function oidc_logout() {
     exit;
 }
 
-// Cleanup old rate limit records periodically
-yourls_add_action('init', function() {
-    // Run cleanup on 1% of requests
+/**
+ * Periodic cleanup of old rate limit records
+ * Runs randomly on 1% of requests to maintain database performance
+ */
+yourls_add_action('init', function(): void {
     if (mt_rand(1, 100) === 1) {
         OIDCRateLimiter::cleanup();
     }
 });
 
-// Enhanced flood protection with OIDC awareness
+/**
+ * Enhanced IP flood protection with OIDC awareness
+ * Integrates with YOURLS flood protection while respecting authenticated users
+ *
+ * @param string $ip IP address to check
+ * @return bool True to continue processing, false to block
+ */
 yourls_add_filter('shunt_check_IP_flood', 'oidc_check_ip_flood');
-function oidc_check_ip_flood($ip): bool
-{
-    // Don't touch API logic
+function oidc_check_ip_flood(string $ip): bool {
+    // Skip API requests
     if (yourls_is_API()) {
         return false;
     }
 
     yourls_do_action('pre_check_ip_flood', $ip);
 
-    // Skip if flood protection disabled
+    // Skip if flood protection is disabled
     if ((defined('YOURLS_FLOOD_DELAY_SECONDS') && YOURLS_FLOOD_DELAY_SECONDS === 0) ||
         !defined('YOURLS_FLOOD_DELAY_SECONDS') ||
         yourls_is_installing()) {
         return true;
     }
 
-    // Don't throttle authenticated users (OIDC or YOURLS)
+    // Don't throttle authenticated users
     if (yourls_is_private()) {
         $oidc_user = oidc_validate_cookie();
         $yourls_auth = isset($_COOKIE[yourls_cookie_name()]) && yourls_check_auth_cookie();
@@ -590,6 +613,7 @@ function oidc_check_ip_flood($ip): bool
         }
     }
 
+    // Perform standard flood check
     $ip = $ip ? yourls_sanitize_ip($ip) : yourls_get_IP();
     yourls_do_action('check_ip_flood', $ip);
 
