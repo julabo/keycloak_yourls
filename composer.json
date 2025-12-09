@@ -1,5 +1,5 @@
 {
-    "name": "julabo/yourls_keycloak",
+    "name": "julabo/keycloak_yourls",
     "description": "Provides Keycloak user authentication with enhanced security",
     "type": "yourls-plugin",
     "license":"MIT",
