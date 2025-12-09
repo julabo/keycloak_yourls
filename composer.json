@@ -1,0 +1,11 @@
+{
+    "name": "julabo/yourls_keycloak",
+    "description": "Provides Keycloak user authentication with enhanced security",
+    "type": "yourls-plugin",
+    "license":"MIT",
+    "require": {
+      "php": ">=7.4",
+      "stevenmaguire/oauth2-keycloak": "^5.0",
+      "yourls/composer-installer": "^1.0"
+    }
+}
