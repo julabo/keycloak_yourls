@@ -5,7 +5,7 @@ Plugin URI: https://github.com/julabo/keycloak_yourls
 Description: Provides Keycloak user authentication with rate limiting and secure session management
 Author: Jan Leehr
 Author URI: https://julabo.com
-Version: 1.0.2
+Version: 1.1.0
 */
 
 // Prevent direct access
@@ -211,7 +211,9 @@ function oidc_refresh_token_if_needed(): bool {
         $oidc = oidc_get_provider();
 
         $refreshToken = new AccessToken([
-            'refresh_token' => $_SESSION['oidc_refresh_token']
+            'access_token' => $_SESSION['oidc_access_token'],
+            'refresh_token' => $_SESSION['oidc_refresh_token'],
+            'expires' => $expires_at
         ]);
 
         $newToken = $oidc->getAccessToken('refresh_token', [
